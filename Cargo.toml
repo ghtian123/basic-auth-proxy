@@ -1,0 +1,17 @@
+[package]
+name = "basic-auth-proxy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = "0.6.1"
+hyper = { version = "0.14.23", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+http = "0.2.8"
+axum-server = { version = "0.4.4", features = ["tls-rustls"] }
+tower-http = { version = "0.3", features = ["map-request-body", "util","auth"] }
+clap = "4.0.29"
