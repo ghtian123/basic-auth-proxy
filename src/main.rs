@@ -8,9 +8,11 @@ use axum_server::tls_rustls::RustlsConfig;
 use http::Version;
 use std::{net::SocketAddr, path::PathBuf};
 
-use hyper::{client::HttpConnector, Body};
+use hyper::Client;
+use hyper::{client::HttpConnector, Body, Uri};
+use hyper_rustls::HttpsConnector;
+
 use tower_http::auth::RequireAuthorizationLayer;
-type Client = hyper::client::Client<HttpConnector, Body>;
 
 use clap::{Arg, ArgAction, Command};
 
@@ -25,7 +27,7 @@ async fn main() {
                 .long("listen_addr")
                 .help("which addr to listen")
                 .action(ArgAction::Set)
-                .num_args(1..)
+                .num_args(1)
                 .default_value("0.0.0.0:3000"),
         )
         .arg(
@@ -34,8 +36,8 @@ async fn main() {
                 .long("proxy_addr")
                 .help("which addr to proxy")
                 .action(ArgAction::Set)
-                .num_args(1..)
-                .default_value("14.215.177.38"),
+                .num_args(1)
+                .default_value("https://www.baidu.com"),
         )
         .arg(
             Arg::new("cert_path")
@@ -43,7 +45,7 @@ async fn main() {
                 .long("cert_path")
                 .help("cert path")
                 .action(ArgAction::Set)
-                .num_args(1..)
+                .num_args(1)
                 .default_value(env!("CARGO_MANIFEST_DIR")),
         )
         .arg(
@@ -52,20 +54,24 @@ async fn main() {
                 .long("user_passwd")
                 .help("user_passwd to auth,eg: test:test")
                 .action(ArgAction::Set)
-                .num_args(1..)
+                .num_args(1)
                 .default_value("test:test"),
         )
         .get_matches();
 
     let proxy = matches
         .get_one::<String>("proxy_addr")
-        .expect("default proxy there is always a value");
+        .expect("default proxy there is always a value")
+        .parse::<Uri>()
+        .expect("proxy uri");
 
     tracing::info!("proxy addr -->{}", proxy);
 
     let listen = matches
         .get_one::<String>("listen_addr")
-        .expect("default listen addr there is always a value");
+        .expect("default listen addr there is always a value")
+        .parse::<SocketAddr>()
+        .expect("listen addr is not socket addr");
 
     tracing::info!("listen addr -->{}", listen);
     let cert_path = PathBuf::from(
@@ -83,7 +89,8 @@ async fn main() {
         .unwrap();
 
     tracing::info!("user->{} passwd->{}", user, passwd);
-    // configure certificate and private key used by https
+
+    // 证书路径
     let config = RustlsConfig::from_pem_file(
         cert_path.join("self_signed_certs").join("cert.pem"),
         cert_path.join("self_signed_certs").join("key.pem"),
@@ -91,43 +98,61 @@ async fn main() {
     .await
     .unwrap();
 
-    let client = Client::new();
+    //hyper 构建https 客户端
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_or_http()
+        .enable_http1()
+        .build();
+
+    let client: Client<HttpsConnector<HttpConnector>, hyper::Body> = Client::builder().build(https);
 
     let app = Router::new()
         .fallback(reserve)
-        .with_state((client, proxy.clone()))
+        .with_state((client, proxy))
         .layer(RequireAuthorizationLayer::basic(user, passwd));
 
-    let addr = listen.parse::<SocketAddr>().unwrap();
-    tracing::info!("listening on {}", addr);
-    axum_server::bind_rustls(addr, config)
+    tracing::info!("listening on {}", listen);
+    axum_server::bind_rustls(listen, config)
         .serve(app.into_make_service())
         .await
         .unwrap();
 }
 
 async fn reserve(
-    State((client, proxy)): State<(Client, String)>,
+    State((client, proxy)): State<(Client<HttpsConnector<HttpConnector>, hyper::Body>, Uri)>,
     mut req: Request<Body>,
 ) -> Response<Body> {
     tracing::info!("proxy request-->{:?}", req.headers());
 
-    let uri_string = format!(
-        "http://{}{}",
-        proxy,
+    //https 代理端域名和证书必须匹配
+    let mut new_uri = Uri::builder().authority(proxy.authority().unwrap().clone());
+
+    new_uri = new_uri.path_and_query(
         req.uri()
             .path_and_query()
             .map(|x| x.as_str())
-            .unwrap_or("/")
+            .unwrap_or("/"),
     );
 
-    let uri = uri_string.parse().unwrap();
-    *req.uri_mut() = uri;
+    new_uri = new_uri.scheme(proxy.scheme_str().unwrap_or("http"));
+
+    tracing::info!("proxy to ->{:?}", &new_uri);
+
+    *req.uri_mut() = new_uri.build().unwrap();
 
     //代理服务端可能不支持http2
     *req.version_mut() = Version::HTTP_11;
 
-    tracing::info!("proxy to ->{}", &uri_string);
-
-    client.request(req).await.unwrap()
+    let response = match client.request(req).await {
+        Ok(response) => response,
+        Err(e) => {
+            tracing::error!("proxy err->{:?}", e);
+            Response::builder()
+                .status(503)
+                .body("503 Service Unavailable".into())
+                .expect("infallible response")
+        }
+    };
+    response
 }

@@ -15,3 +15,4 @@ http = "0.2.8"
 axum-server = { version = "0.4.4", features = ["tls-rustls"] }
 tower-http = { version = "0.3", features = ["map-request-body", "util","auth"] }
 clap = "4.0.29"
+hyper-rustls = "0.23.2"
