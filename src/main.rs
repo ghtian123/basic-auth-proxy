@@ -8,92 +8,68 @@ use axum_server::tls_rustls::RustlsConfig;
 use http::Version;
 use std::{net::SocketAddr, path::PathBuf};
 
-use hyper::Client;
-use hyper::{client::HttpConnector, Body, Uri};
+use hyper::{client::HttpConnector, Body, Client, Uri};
 use hyper_rustls::HttpsConnector;
 
 use tower_http::auth::RequireAuthorizationLayer;
 
-use clap::{Arg, ArgAction, Command};
+use anyhow::{anyhow, Result};
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Proxy {
+    #[clap(
+        short = 'l',
+        long = "listen_addr",
+        default_value = "0.0.0.0:3000",
+        help = "proxy server  listen"
+    )]
+    listen_addr: SocketAddr,
+
+    #[clap(
+        short = 'p',
+        long = "proxy_addr",
+        default_value = "https://www.baidu.com",
+        help = "which addr to proxy"
+    )]
+    proxy_addr: Uri,
+
+    #[clap(
+        short = 'c',
+        long = "cert_path",
+        default_value = "./",
+        help = "cert_path"
+    )]
+    cert_path: PathBuf,
+
+    #[clap(
+        short = 'u',
+        long = "user_passwd",
+        default_value = "test:test",
+        help = "user_passwd to auth,eg: test:test",
+        value_parser = parse_user_passwd,
+    )]
+    user_passwd: (String, String),
+}
+
+fn parse_user_passwd(s: &str) -> Result<(String, String)> {
+    s.split_once(':')
+        .and_then(|(x1, x2)| Some((x1.to_string(), x2.to_string())))
+        .ok_or(anyhow!("user_passwd input err: {}", s))
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let matches = Command::new("proxy server")
-        .arg(
-            Arg::new("listen_addr")
-                .short('l')
-                .long("listen_addr")
-                .help("which addr to listen")
-                .action(ArgAction::Set)
-                .num_args(1)
-                .default_value("0.0.0.0:3000"),
-        )
-        .arg(
-            Arg::new("proxy_addr")
-                .short('p')
-                .long("proxy_addr")
-                .help("which addr to proxy")
-                .action(ArgAction::Set)
-                .num_args(1)
-                .default_value("https://www.baidu.com"),
-        )
-        .arg(
-            Arg::new("cert_path")
-                .short('c')
-                .long("cert_path")
-                .help("cert path")
-                .action(ArgAction::Set)
-                .num_args(1)
-                .default_value(env!("CARGO_MANIFEST_DIR")),
-        )
-        .arg(
-            Arg::new("user_passwd")
-                .short('u')
-                .long("user_passwd")
-                .help("user_passwd to auth,eg: test:test")
-                .action(ArgAction::Set)
-                .num_args(1)
-                .default_value("test:test"),
-        )
-        .get_matches();
-
-    let proxy = matches
-        .get_one::<String>("proxy_addr")
-        .expect("default proxy there is always a value")
-        .parse::<Uri>()
-        .expect("proxy uri");
-
-    tracing::info!("proxy addr -->{}", proxy);
-
-    let listen = matches
-        .get_one::<String>("listen_addr")
-        .expect("default listen addr there is always a value")
-        .parse::<SocketAddr>()
-        .expect("listen addr is not socket addr");
-
-    tracing::info!("listen addr -->{}", listen);
-    let cert_path = PathBuf::from(
-        matches
-            .get_one::<String>("cert_path")
-            .expect("default cert path there is always a value"),
-    );
-
-    tracing::info!("cert path-->{:?}", cert_path);
-
-    let (user, passwd) = matches
-        .get_one::<String>("user_passwd")
-        .expect("default user passwd is always a value")
-        .split_once(':')
-        .unwrap();
-
-    tracing::info!("user->{} passwd->{}", user, passwd);
+    let proxy = Proxy::parse();
+    tracing::info!("{:?}", proxy);
 
     // 证书路径
     let config = RustlsConfig::from_pem_file(
-        cert_path.join("self_signed_certs").join("cert.pem"),
-        cert_path.join("self_signed_certs").join("key.pem"),
+        proxy.cert_path.join("self_signed_certs").join("cert.pem"),
+        proxy.cert_path.join("self_signed_certs").join("key.pem"),
     )
     .await
     .unwrap();
@@ -109,11 +85,14 @@ async fn main() {
 
     let app = Router::new()
         .fallback(reserve)
-        .with_state((client, proxy))
-        .layer(RequireAuthorizationLayer::basic(user, passwd));
+        .with_state((client, proxy.proxy_addr))
+        .layer(RequireAuthorizationLayer::basic(
+            proxy.user_passwd.0.as_str(),
+            proxy.user_passwd.1.as_str(),
+        ));
 
-    tracing::info!("listening on {}", listen);
-    axum_server::bind_rustls(listen, config)
+    tracing::info!("listening on {}", proxy.listen_addr);
+    axum_server::bind_rustls(proxy.listen_addr, config)
         .serve(app.into_make_service())
         .await
         .unwrap();
